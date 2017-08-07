@@ -6,13 +6,13 @@
 #include <linux/vmalloc.h>
 
 #define MIN_HTTP_REQ_LEN 16
-#define HTTP_METHODS_AMOUNT 8
 
 static struct nf_hook_ops nfho;
-static char *http_methods[HTTP_METHODS_AMOUNT] = {"GET", "OPTIONS", "HEAD", "POST",
-                                                  "PUT", "DELETE", "TRACE", "CONNECT"};
-
-int check_valid_method(const unsigned char *tcp_data);
+static char *http_methods[] = {"GET", "OPTIONS", "HEAD", "POST",
+                              "PUT", "DELETE", "TRACE", "CONNECT", ""};
+static char *http_versions[] = {"0.9", "1.0", "1.1", "1.2", "2.0", ""};
+static int check_valid_option(const unsigned char *tcp_data, char *options[]);
+static bool check_ws_upgrade(const unsigned char *tcp_data, int data_length);
 
 /*
 This function assumes a packet is HTTP if it abides exactly by the format specified for a request line in
@@ -38,7 +38,6 @@ unsigned int http_filter_hook(unsigned int hooknum,
 
         unsigned char *tcp_data;
         unsigned char *tail;
-        unsigned char *it;
         int data_length;
 
         tcp_header = tcp_hdr(skb);
@@ -51,12 +50,13 @@ unsigned int http_filter_hook(unsigned int hooknum,
 
         data_length = tail - tcp_data;
 
+        // i wish i could use regexps here
         if(data_length < MIN_HTTP_REQ_LEN) // minimum length of a HTTP request packet
                 return NF_ACCEPT;
 
         int res;
 
-        res = check_valid_method(tcp_data);
+        res = check_valid_option(tcp_data, http_methods);
 
         if (res ==  -1)
                 return NF_ACCEPT;
@@ -66,21 +66,80 @@ unsigned int http_filter_hook(unsigned int hooknum,
         if (tcp_data[end_of_method_ind] != ' ') // missing sp after method
                 return NF_ACCEPT;
 
+        if (tcp_data[end_of_method_ind + 1] != '/') // indicator that the URL is starting
+                return NF_ACCEPT;
+
+        int i;
+        for(i = end_of_method_ind + 2; i < data_length; i++) {
+                if (tcp_data[i] == '\0' || tcp_data[i] == '\n' || tcp_data[i] == '\r')
+                        return NF_ACCEPT;
+                if (tcp_data[i] == ' ') // managed to find a space in this line
+                        break;
+        }
+        if (i == data_length) // we can't be sure the data is null terminated
+                return NF_ACCEPT;
+
+        char *version_pos;
+        char *http_ver_beginning_p = tcp_data + i + 1; // start_of_packet + offset_to_2ndspace + 1
+        version_pos = strnstr(http_ver_beginning_p, "HTTP/", 5);
+        if (version_pos == NULL)
+                return NF_ACCEPT;
+
+        if (version_pos != http_ver_beginning_p) // one character after the space
+                return NF_ACCEPT;
+
+        res = check_valid_option(http_ver_beginning_p + 5, http_versions);
+        if (res == -1)
+                return NF_ACCEPT;
+
+        char *end_of_version = http_ver_beginning_p + 5 + strlen(http_versions[res]);
+        if (end_of_version[0] != '\r' || end_of_version[1] != '\n') // bad end of line
+                return NF_ACCEPT;
+
+        if (check_ws_upgrade(tcp_data, data_length))
+                return NF_ACCEPT;
+
         return NF_DROP;
 }
 
-int check_valid_method(const unsigned char *tcp_data)
+/*
+Checks if the data given starts with a valid option from the options array given and returns the index in the
+options array of the option that was found, else returns -1
+*/
+static int check_valid_option(const unsigned char *tcp_data, char *options[])
 {
-        int i;
-        char *method_pos; // the address of the method string that is a part of tcp_data
-        for (i = 0; i < HTTP_METHODS_AMOUNT; i++) {
-                method_pos = strnstr(tcp_data, http_methods[i], strlen(http_methods[i]));
-                if (method_pos != NULL) {
-                        if(method_pos == tcp_data) // means that the method was found in index 0 (same address)
+        int i = 0;
+        char **it;
+        char *option_pos;
+        it = options;
+        while (*it != "") {
+                option_pos = strnstr(tcp_data, *it, strlen(*it));
+                if (option_pos != NULL) {
+                        if (option_pos == tcp_data) // means that the option was found in index 0 (same address)
                                 return i;
                 }
+                it++;
+                i++;
         }
         return -1;
+}
+
+/*
+Called after determining the packet is a valid HTTP packet.
+Checks if the packet is part of the websocket handshake.
+*/
+static bool check_ws_upgrade(const unsigned char *http_data, int data_length)
+{
+        char *res;
+        res = strnstr(http_data, "\r\nUpgrade: websocket\r\n", data_length);
+        if (res == NULL)
+                return false;
+
+        res = strnstr(http_data, "\r\nConnection: Upgrade\r\n", data_length);
+        if (res == NULL)
+                return false;
+
+        return true;
 }
 
 int init_module()
@@ -99,8 +158,7 @@ int init_module()
         return 0;
 }
 
-//Called when module unloaded using 'rmmod'
 void cleanup_module()
 {
-        nf_unregister_hook(&nfho);                     //cleanup – unregister hook
+        nf_unregister_hook(&nfho);
 }
