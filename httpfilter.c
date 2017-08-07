@@ -3,7 +3,6 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <linux/vmalloc.h>
 
 #define MIN_HTTP_REQ_LEN 16
 
